@@ -1,0 +1,8 @@
+requests>=2.31.0
+python-dotenv>=1.0.0
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Solana signing (required for broadcast tests)
+solders>=0.21.0
+base58>=2.1.1
