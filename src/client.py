@@ -1,6 +1,8 @@
 import json
 import os
 import uuid
+import re
+import time
 from typing import Optional
 
 import requests
@@ -30,19 +32,49 @@ class MultiHopperClient:
             idem_key: Optional[str] = None, extra_headers: Optional[dict] = None
             ) -> tuple[int, dict]:
         url = f"{self.base}/api/v1{path}"
-        try:
-            r = requests.request(
-                method, url, json=body,
-                headers=self._headers(idem_key, extra_headers),
-                timeout=30,
-            )
+        method = method.upper()
+        json_body = body
+        if json_body is None and method in {"POST", "PUT", "PATCH"}:
+            json_body = {}
+        
+        max_retries = 5
+        for attempt in range(max_retries):
             try:
-                data = r.json()
-            except Exception:
-                data = {"raw": r.text}
-            return r.status_code, data
-        except Exception as e:
-            return 0, {"error": str(e)}
+                r = requests.request(
+                    method, url, json=json_body,
+                    headers=self._headers(idem_key, extra_headers),
+                    timeout=30,
+                )
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"raw": r.text}
+                
+                if r.status_code == 429 and attempt < max_retries - 1:
+                    retry_seconds = 2
+                    if "Retry-After" in r.headers:
+                        try:
+                            retry_seconds = int(r.headers["Retry-After"])
+                        except ValueError:
+                            pass
+                    else:
+                        msg = data.get("error", {}).get("message", "")
+                        m = re.search(r"Retry after\s+(\d+)", msg, re.IGNORECASE)
+                        if m:
+                            retry_seconds = int(m.group(1))
+                    
+                    print(f"  [Rate Limit] HTTP 429. Sleeping {retry_seconds + 1}s before retry (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(retry_seconds + 1)
+                    continue
+                
+                return r.status_code, data
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"  [Network Error] {e}. Retrying in 2s...")
+                    time.sleep(2)
+                    continue
+                return 0, {"error": str(e)}
+        return 0, {"error": "Max retries exceeded"}
 
     def estimate(self, token_mint: str, amount_raw: str, token_decimals: int, hops: int
                  ) -> tuple[int, dict]:
@@ -94,4 +126,3 @@ class MultiHopperClient:
             qs = "&".join(f"{k}={v}" for k, v in params.items())
             path += f"?{qs}"
         return self.raw("GET", path)
-

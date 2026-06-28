@@ -1,15 +1,26 @@
 import base64
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-try:
+if TYPE_CHECKING:
     import base58
     from solders.keypair import Keypair
     from solders.transaction import VersionedTransaction
     from solders.transaction import Transaction as LegacyTransaction
     AVAILABLE = True
-except ImportError:
-    AVAILABLE = False
+else:
+    try:
+        import base58
+        from solders.keypair import Keypair
+        from solders.transaction import VersionedTransaction
+        from solders.transaction import Transaction as LegacyTransaction
+        AVAILABLE = True
+    except ImportError:
+        base58 = None
+        Keypair = None
+        VersionedTransaction = None
+        LegacyTransaction = None
+        AVAILABLE = False 
 
 
 def load_keypair(private_key_b58: Optional[str] = None) -> Optional["Keypair"]:

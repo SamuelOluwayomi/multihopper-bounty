@@ -21,6 +21,7 @@ from src.agent import (
     test_concurrent_prepare,
     test_claude_md_mainnet_url,
 )
+from src.deep_probes import run_deep_probes
 
 SOURCE  = os.environ.get("SOURCE_WALLET", "")
 DEST    = os.environ.get("RECIPIENT_WALLET", "")
@@ -60,6 +61,9 @@ def test_duplicate_idempotency_key():
     idem = str(uuid.uuid4())
     s1, d1 = client.create(SOURCE, DEST, idem_key=idem)
     s2, d2 = client.create(SOURCE, DEST, idem_key=idem)
+    if s1 == 0 or s2 == 0:
+        print(f"  SKIP: API/network request failed (HTTP {s1}, HTTP {s2})")
+        return
     if s1 == s2 and d1.get("id") == d2.get("id"):
         print("  PASS — same id returned")
     else:
@@ -78,6 +82,9 @@ def test_conflicting_idempotency_key():
     idem = str(uuid.uuid4())
     s1, d1 = client.create(SOURCE, DEST, idem_key=idem, hops=3)
     s2, d2 = client.create(SOURCE, DEST, idem_key=idem, overrides={"hops": 5})
+    if s1 == 0 or s2 == 0:
+        print(f"  SKIP: API/network request failed (HTTP {s1}, HTTP {s2})")
+        return
     if s2 == 409 or d1.get("id") == d2.get("id"):
         print("  PASS")
     else:
@@ -286,7 +293,7 @@ def test_signing_preserves_server_sigs():
             else:
                 record(Finding(
                     title="Server partial signature overwritten during client signing",
-                    severity="Critical", flow_step="Client signing (VersionedTransaction)",
+                    severity="Documentation blocker", flow_step="Client signing (VersionedTransaction)",
                     description="sign_versioned overwrote a server pre-signed ephemeral slot. "
                                 "This will cause broadcast failure for any route using server partial sigs.",
                     expected="Server sigs in their original slots after client signing",
@@ -294,6 +301,9 @@ def test_signing_preserves_server_sigs():
                     proposed_fix="Only replace your pubkey's slot index. Never call tx.sign() (replaces all). "
                                  "Warn about this in the TypeScript signing example — web3.js tx.sign([kp]) "
                                  "DOES overwrite all slots.",
+                    confidence="High",
+                    evidence_level="Local signing helper corrupted partial signatures; no on-chain fund loss proven",
+                    severity_rationale="Documentation/integration blocker rather than Critical until tied to live failed execution or fund impact.",
                 ))
         else:
             print("  INFO: no keeperFundingTx to verify sig preservation")
@@ -446,8 +456,13 @@ def main():
     test_zero_amount()
     test_invalid_token_mint()
     test_concurrent_prepare()
+    run_deep_probes()
 
     generate_report("reports/mh_bug_report.md")
+
+    if os.environ.get("MH_SKIP_AI") == "1":
+        print("\n[AI] Skipping AI enrichment/red-team because MH_SKIP_AI=1")
+        return
 
     from src.ai_enricher import enrich_report
     enrich_report()
@@ -458,5 +473,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

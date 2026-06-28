@@ -144,7 +144,6 @@ class TestSigningWithRealPreparedTxs:
             assert server_sigs_preserved(
                 prepared["keeperFundingTx"], signed["keeperFundingTx"]
             ), (
-                "CRITICAL: sign_all() overwrote server partial signature on keeperFundingTx. "
-                "This will cause broadcast failure."
+                "Signing defect: sign_all() overwrote server partial signature on keeperFundingTx. "
+                "This proves integration failure risk, not direct fund loss."
             )
-

@@ -7,6 +7,9 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from src.client import MultiHopperClient
 from src.findings import record, Finding
+from src.evidence_index import build_oracle_context
+from src.oracle_scenarios import SCENARIOS, run_scenario
+from src.redaction import redact_text, safe_json, sanitize
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
@@ -14,10 +17,20 @@ GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 client = MultiHopperClient()
 SOURCE = os.environ.get("SOURCE_WALLET", "")
 DEST   = os.environ.get("RECIPIENT_WALLET", "")
+ORACLE_CONTEXT = build_oracle_context()
+ORACLE_TURNS = int(os.environ.get("MH_ORACLE_TURNS", "12"))
+
+
+def _safe_error(exc: Exception) -> str:
+    text = str(exc)
+    for secret in (GEMINI_KEY, GROQ_KEY):
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text
 
 SYSTEM_PROMPT = f"""
 You are an autonomous AI Red-Team Agent testing the MultiHopper Solana API.
-Your goal is to find logical validation errors, validation bypasses, race conditions, metadata gaps, or critical smart contract integrity vulnerabilities by interacting with the API client.
+Your goal is to find high-impact agentic-flow vulnerabilities, especially state-machine, signature-binding, idempotency, retry/resume, and monitoring failures.
 
 Available variables you must use for wallets:
 - SOURCE_WALLET: "{SOURCE}"
@@ -30,37 +43,40 @@ You have access to a MultiHopperClient with the following helper methods:
 4. client.get(transfer_id)
 5. client.list(**params)
 6. client.raw(method, path, body, idem_key) - for arbitrary path execution
+7. scenario(name, args) - runs a named multi-step probe and returns structured evidence
+
+Available scenarios:
+{json.dumps(sorted(SCENARIOS.keys()), indent=2)}
+
+{ORACLE_CONTEXT}
 
 Rules of execution:
-- You will run in a loop for 10 turns.
+- You will run in a loop for {ORACLE_TURNS} turns.
 - In each turn, you output a JSON action block to call a client method or raw API path.
 - The execution result (HTTP status + response body) will be fed back to you.
-- DO NOT test simple type constraints (e.g. sending text in number fields or negative numbers) because the API's static schema validates these.
-- Focus your testing on LOGICAL AND STRUCTURAL gaps:
-  - Mismatched amountRaw and amountTokens (e.g. amountRaw=1000000000 but amountTokens=0.000001).
-  - Self-transfers (sourceOwner == recipientWallet).
-  - Fake/spoofed signatures on confirm-broadcast (does it accept arbitrary strings?).
-  - Invalid but syntactically correct Base58 Solana public keys for tokenMint or wallets (does it accept any 44-char base58 string?).
-  - Duplicate externalId across different transfers.
-  - Calling confirm-broadcast before prepare, or missing keeper signatures.
-  - Race conditions by triggering concurrent operations or duplicate keys.
+- DO NOT repeat known prior evidence unless your variant is materially stronger.
+- DO NOT spend turns on simple type constraints, negative values, hops bounds, self-transfer, basic amount mismatch, or overrides/status injection. Those are already covered.
+- Prefer scenario(...) calls over one-off raw calls when testing multi-step invariants.
+- After any rejected confirm-broadcast, inspect GET /transfers/:id to detect accidental state mutation.
+- Treat HTTP 429 as rate-limit noise, not a finding.
+- Treat HTTP 0 / connection errors as environment failures, not findings.
+- A strong finding must include exact endpoint flow, expected invariant, actual transition, and agentic impact.
+- Never overstate severity. Critical requires proof of live credential-value disclosure, unauthorized access, unauthorized fund movement, cross-tenant access, RCE, or equivalent. If proof is only quote-state corruption, schema leakage, rejected bypass, or documentation failure, cap severity below Critical and explain the cap.
 
 Output format for your turn MUST be ONLY a JSON object:
 {{
   "thought": "Why I am targeting this endpoint and what vulnerability I am testing.",
-  "method": "create" | "prepare" | "confirm_broadcast" | "get" | "list" | "raw",
+  "method": "create" | "prepare" | "confirm_broadcast" | "get" | "list" | "raw" | "scenario",
   "args": {{ ... }}
 }}
 
 Example:
 {{
-  "thought": "Testing if the API accepts sourceOwner == recipientWallet (self-transfer).",
-  "method": "create",
+  "thought": "Testing if confirm-broadcast accepts signature arrays that do not match the prepared bundle cardinality.",
+  "method": "scenario",
   "args": {{
-    "source_owner": "{SOURCE}",
-    "recipient": "{SOURCE}",
-    "amount_raw": "100000000",
-    "amount_tokens": "0.1"
+    "name": "confirm_wrong_cardinality",
+    "args": {{}}
   }}
 }}
 """
@@ -150,8 +166,8 @@ def run_consensus_turn(messages: list) -> dict:
         print("  [ORACLE] Error: Both models offline or keys missing.")
         return {}
 
-    print(f"  [ORACLE Gemma 4] proposes: {prop_gemma.get('method')} → {(prop_gemma.get('thought') or '')[:60]}...")
-    print(f"  [ORACLE Llama 3.3] proposes: {prop_llama.get('method')} → {(prop_llama.get('thought') or '')[:60]}...")
+    print(f"  [ORACLE Gemma 4] proposes: {prop_gemma.get('method')} -> {(prop_gemma.get('thought') or '')[:60]}...")
+    print(f"  [ORACLE Llama 3.3] proposes: {prop_llama.get('method')} -> {(prop_llama.get('thought') or '')[:60]}...")
 
     if prop_gemma.get("method") == prop_llama.get("method") and list(prop_gemma.get("args", {}).keys()) == list(prop_llama.get("args", {}).keys()):
         print("  [ORACLE CONSENSUS] Agreement reached. Executing proposal.")
@@ -178,7 +194,7 @@ Choose the better proposal. Output ONLY the chosen proposal as a JSON object mat
         referee_messages = messages + [{"role": "user", "content": referee_prompt}]
         decision = query_gemma4(referee_messages)
         if decision and "method" in decision:
-            print(f"  [ORACLE REFEREE DECISION] Selected: {decision.get('method')} → {(decision.get('thought') or '')[:60]}...")
+            print(f"  [ORACLE REFEREE DECISION] Selected: {decision.get('method')} -> {(decision.get('thought') or '')[:60]}...")
             return decision
     except Exception:
         pass
@@ -191,7 +207,7 @@ def execute_action(action: dict) -> tuple[int, dict]:
     method = action.get("method")
     args = action.get("args", {})
 
-    print(f"  [EXECUTE] Calling client.{method} with args: {args}")
+    print(f"  [EXECUTE] Calling {method} with args: {safe_json(args, max_chars=500)}")
 
     if method == "create":
         return client.create(
@@ -222,6 +238,8 @@ def execute_action(action: dict) -> tuple[int, dict]:
             body=args.get("body"),
             idem_key=args.get("idem_key")
         )
+    elif method == "scenario":
+        return run_scenario(args.get("name", ""), args.get("args", {}))
     else:
         return 0, {"error": f"Unknown method: {method}"}
 
@@ -229,6 +247,7 @@ def execute_action(action: dict) -> tuple[int, dict]:
 def save_findings_log(new_text: str):
     path = "reports/ai_red_team_findings.md"
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    new_text = redact_text(new_text)
     
     timestamp = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())
     run_header = f"\n\n---\n## AI Red-Team Run: {timestamp}\n\n"
@@ -241,6 +260,20 @@ def save_findings_log(new_text: str):
         print(f"  [AI] Creating new findings registry: {path}")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("# Autonomous AI Red Team Findings\n" + run_header + new_text.strip())
+
+
+def save_trace(turn: int, action: dict, status: int, response: dict):
+    path = "reports/ai_oracle_trace.jsonl"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    event = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "turn": turn,
+        "action": sanitize(action),
+        "http": status,
+        "response": sanitize(response),
+    }
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(safe_json(event) + "\n")
 
 
 def run_ai_red_team():
@@ -259,18 +292,20 @@ def run_ai_red_team():
         {"role": "user", "content": "Start turn 1. Decide your first target payload."}
     ]
 
-    for turn in range(1, 11):
-        print(f"\n--- TURN {turn}/10 ---")
+    for turn in range(1, ORACLE_TURNS + 1):
+        print(f"\n--- TURN {turn}/{ORACLE_TURNS} ---")
         action = run_consensus_turn(messages)
         if not action or "method" not in action:
             print("  [AI RED TEAM] Invalid or empty response from Oracle.")
             break
 
         print(f"  [DECISION THOUGHT] {action.get('thought')}")
+        action = sanitize(action)
         status, response = execute_action(action)
-        print(f"  [RESPONSE] HTTP {status}: {json.dumps(response)[:200]}")
+        print(f"  [RESPONSE] HTTP {status}: {safe_json(response, max_chars=500)}")
+        save_trace(turn, action, status, response)
 
-        feedback = f"Result of turn {turn}: HTTP {status}. Response body: {json.dumps(response)}"
+        feedback = f"Result of turn {turn}: HTTP {status}. Response body: {safe_json(response)}"
         messages.append({"role": "assistant", "content": json.dumps(action)})
         messages.append({"role": "user", "content": feedback + "\nDecide your next action block."})
         time.sleep(3)
@@ -280,8 +315,11 @@ def run_ai_red_team():
     messages.append({
         "role": "user",
         "content": (
-            "You have completed your 10 turns. Identify any logical bugs, validation gaps, "
+            f"You have completed your {ORACLE_TURNS} turns. Identify any logical bugs, validation gaps, "
             "or security vulnerabilities you found. Write a detailed security report. "
+            "Do not report known prior findings unless this run produced stronger new evidence. "
+            "Do not report HTTP 0, DNS, timeout, or HTTP 429 rate-limit events as vulnerabilities. "
+            "Never claim a severity higher than the proof supports. Include a Severity Calibration line for each finding. "
             "For each finding, provide: "
             "1. Title & Severity (Critical/High/Medium/Low) "
             "2. Vulnerability Description (Why the observed behavior is unsafe) "
@@ -319,10 +357,10 @@ def run_ai_red_team():
                 resp = requests.post(url, json={"contents": contents}, timeout=30)
                 text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
             except Exception as e:
-                print(f"Failed to generate final summary via REST: {e}")
+                print(f"Failed to generate final summary via REST: {_safe_error(e)}")
                 return
         except Exception as e:
-            print(f"Failed to generate final summary via SDK: {e}")
+            print(f"Failed to generate final summary via SDK: {_safe_error(e)}")
             return
             
         print("\n=== AI EXPLORATORY FINDINGS ===")
@@ -347,7 +385,7 @@ def run_ai_red_team():
             print("===============================")
             save_findings_log(text)
         except Exception as e:
-            print(f"Failed to generate final summary via Groq: {e}")
+            print(f"Failed to generate final summary via Groq: {_safe_error(e)}")
 
 
 if __name__ == "__main__":

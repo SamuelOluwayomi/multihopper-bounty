@@ -3,7 +3,7 @@ import sys
 import uuid
 import json
 import time
-import threading
+import threading 
 import requests
 from typing import Optional
 
@@ -83,9 +83,17 @@ def run_full_agentic_flow() -> dict:
     mem.log("create", s, d)
     if s not in (200, 201):
         return {"aborted": True, "reason": "create_failed", "status": s}
-    mem.transfer_id = d.get("id")
+    transfer_id = d.get("id")
+    if not isinstance(transfer_id, int):
+        return {
+            "aborted": True,
+            "reason": "missing_transfer_id",
+            "status": s,
+            "response_keys": list(d.keys()),
+        }
+    mem.transfer_id = transfer_id
 
-    s, d = client.prepare(mem.transfer_id)
+    s, d = client.prepare(transfer_id)
     mem.log("prepare", s, d)
     if s != 200:
         return {"aborted": True, "reason": "prepare_failed", "status": s}
@@ -104,7 +112,7 @@ def run_full_agentic_flow() -> dict:
         ))
         return {"aborted": True, "reason": "no_prepared_txs"}
 
-    _check_null_fields(mem.prepared_txs, mem.transfer_id)
+    _check_null_fields(mem.prepared_txs, transfer_id)
     signed = sign_all(mem.prepared_txs, keypair)
 
     keeper_tx = signed.get("keeperFundingTx")
@@ -113,7 +121,7 @@ def run_full_agentic_flow() -> dict:
         if keeper_sig:
             mem.keeper_sig = keeper_sig
             _wait_confirmed(keeper_sig, "keeperFundingTx")
-            s, d = client.confirm_broadcast(mem.transfer_id, {
+            s, d = client.confirm_broadcast(transfer_id, {
                 "routeInitSignatures": [],
                 "keeperFundingSignature": keeper_sig,
             })
@@ -147,23 +155,23 @@ def run_full_agentic_flow() -> dict:
         if sig:
             _wait_confirmed(sig, f"sessionInitTxs[{i}]")
 
-    s, d = client.confirm_broadcast(mem.transfer_id, {
+    s, d = client.confirm_broadcast(transfer_id, {
         "keeperFundingSignature": mem.keeper_sig or "",
         "routeInitSignatures": [],
     })
     mem.log("confirm-broadcast-2 (final)", s, d)
 
-    print(f"\n[AGENT] Polling transfer {mem.transfer_id}...")
+    print(f"\n[AGENT] Polling transfer {transfer_id}...")
     for _ in range(10):
         time.sleep(6)
-        s, d = client.get(mem.transfer_id)
+        s, d = client.get(transfer_id)
         status = d.get("status") or d.get("transfer", {}).get("status", "?")
         progress = d.get("progress") or d.get("transfer", {}).get("progress", {})
         print(f"  [POLL] status={status} progress={progress}")
         if status in ("completed", "failed", "expired", "refunded"):
             break
 
-    return {"transfer_id": mem.transfer_id, "step_log": mem.step_log}
+    return {"transfer_id": transfer_id, "step_log": mem.step_log}
 
 
 def _check_null_fields(prepared_txs: dict, transfer_id: int):
@@ -184,7 +192,7 @@ def _check_null_fields(prepared_txs: dict, transfer_id: int):
 
 
 def test_typescript_signing_bug():
-    print("\n[TEST] TypeScript tx.sign([kp]) destroys server partial signatures (Critical)")
+    print("\n[TEST] TypeScript tx.sign([kp]) destroys server partial signatures (Documentation blocker)")
     print("  Confirmed from official docs — lines 123-126 of /guides/agentic-integration")
     print("  The documented TypeScript signVersioned uses VersionedTransaction.sign([keypair])")
     print("  web3.js VersionedTransaction.sign() REPLACES the entire signatures array,")
@@ -192,7 +200,7 @@ def test_typescript_signing_bug():
     print("  Python code in same docs is correct (slot-level replacement). TypeScript is not.")
     record(Finding(
         title="Official TypeScript signing example destroys server partial signatures",
-        severity="Critical",
+        severity="Documentation blocker",
         flow_step="Client-side signing (TypeScript)",
         description=(
             "The official agentic integration guide (https://dev-docs.multihopper.com/guides/agentic-integration) "
@@ -215,6 +223,9 @@ def test_typescript_signing_bug():
             "round-trip after manual sig injection. Add a Warning callout to the docs matching the "
             "Python Warning already present."
         ),
+        confidence="High",
+        evidence_level="Documented code path and known web3.js signing behavior; no live funds moved",
+        severity_rationale="Documentation blocker because the proof shows integration failure, not unauthorized fund movement.",
     ))
 
 
@@ -242,7 +253,7 @@ def test_fake_keeper_signature():
     if s3 in (200, 201):
         record(Finding(
             title="confirm-broadcast accepts fabricated keeperFundingSignature without on-chain validation",
-            severity="Critical",
+            severity="High",
             flow_step="POST /transfers/:id/confirm-broadcast",
             description=(
                 "confirm-broadcast accepted a fabricated 88-character base58 string as "
@@ -258,6 +269,9 @@ def test_fake_keeper_signature():
                 "on-chain via getSignatureStatuses before accepting. Return a specific MH error code "
                 "for invalid/unconfirmed signatures."
             ),
+            confidence="Medium",
+            evidence_level="API accepted fabricated signature; no on-chain loss or keeper loss demonstrated",
+            severity_rationale="High only if acceptance changes transfer state. Critical would require proof of fund loss or unauthorized execution.",
         ))
     else:
         print(f"  PASS — fake signature rejected (HTTP {s3})")
@@ -270,6 +284,9 @@ def test_amount_mismatch():
         amount_raw="1000000000",
         amount_tokens="0.0001",
     )
+    if s == 0:
+        print("  SKIP - API/network request failed")
+        return
     if s in (200, 201):
         record(Finding(
             title="Inconsistent amountRaw/amountTokens accepted at creation",
@@ -296,6 +313,9 @@ def test_amount_mismatch():
 def test_self_transfer():
     print("\n[TEST] sourceOwner == recipientWallet accepted")
     s, d = client.create(SOURCE, SOURCE)
+    if s == 0:
+        print("  SKIP - API/network request failed")
+        return
     if s in (200, 201):
         record(Finding(
             title="Self-transfer (sourceOwner == recipientWallet) accepted",
@@ -318,6 +338,9 @@ def test_self_transfer():
 def test_zero_amount():
     print("\n[TEST] amountRaw=0 accepted at creation")
     s, d = client.create(SOURCE, DEST, amount_raw="0", amount_tokens="0")
+    if s == 0:
+        print("  SKIP - API/network request failed")
+        return
     if s in (200, 201):
         record(Finding(
             title="Zero-amount transfer accepted at creation",
@@ -339,6 +362,9 @@ def test_zero_amount():
 def test_invalid_token_mint():
     print("\n[TEST] Invalid tokenMint (non-Solana-pubkey) accepted at creation")
     s, d = client.create(SOURCE, DEST, token_mint="not-a-valid-pubkey-string", overrides={"tokenMint": "not-a-valid-pubkey-string"})
+    if s == 0:
+        print("  SKIP - API/network request failed")
+        return
     if s in (200, 201):
         record(Finding(
             title="Invalid tokenMint format accepted at creation, fails silently later",

@@ -37,8 +37,9 @@ copy .env.example .env
 # 5a. Run the full pytest suite
 python -m pytest tests/ -v
 
-# 5b. Or run the standalone harness directly (writes reports/mh_bug_report.md)
-python src/harness.py
+# 5b. Or run the full calibrated bounty workflow
+python scripts/run_all.py
+# writes reports/submission_report.md
 ```
 
 ---
@@ -61,6 +62,7 @@ multihopper-bounty/
 │   └── test_status_polling.py  # GET /transfers/:id monitoring tests
 ├── reports/                 # Auto-generated bug reports (git-ignored)
 ├── scripts/
+│   ├── run_all.py           # Full calibrated workflow + consolidated report
 │   └── generate_report.py   # Standalone report generator CLI
 ├── CLAUDE.md                # Agent context file (MultiHopper API summary)
 ├── pyproject.toml           # pytest configuration
@@ -73,7 +75,7 @@ multihopper-bounty/
 
 ## Submission Format
 
-Each finding in `reports/mh_bug_report.md` follows the bounty format:
+Each finding in `reports/submission_report.md` follows the bounty format:
 - **Title** + severity (Critical / High / Medium / Low / Documentation)
 - **Environment** + flow step
 - **Steps to reproduce** (the test that triggered it)
